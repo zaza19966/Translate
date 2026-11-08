@@ -6,9 +6,12 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -27,6 +30,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.google.mlkit.nl.languageid.LanguageIdentification
@@ -53,34 +57,157 @@ object Prefs {
     const val NAME = "settings"
     const val SRC = "src"            // "auto" أو رمز لغة
     const val TGT = "tgt"
-    const val REGION = "region"      // 0 كامل، 1 النصف السفلي، 2 الثلث السفلي
-    const val INTERVAL = "interval"  // مللي ثانية
-    const val REFRESH = "refresh"    // مللي ثانية
-    const val OPACITY = "opacity"    // 40..100
-    const val SMART = "smart"        // فلتر اللغة الذكي
+    const val INTERVAL = "interval"  // فاصل الفحص (مللي ثانية)
+    const val REFRESH = "refresh"    // فاصل التحقق من تغيّر النص (0 = إيقاف)
+    const val TTL = "ttl"            // عمر الترجمة على الشاشة (0 = بلا حد)
+    const val OPACITY = "opacity"    // عتمة الخلفية 40..100
+    const val SMART = "smart"        // فلتر اللغة
+    const val STRICT = "strict"      // فلتر لغة صارم
+    const val CONF = "conf"          // حد ثقة القراءة 0..95
+    const val SCALE = "scale"        // جودة الفحص 40..100
+    const val GLOSSARY = "glossary"  // قاموس مخصص: نص=ترجمة
+    // المناطق: "inc" = منطقة الترجمة، "exc" = منطقة الاستبعاد
+    // مفاتيحها: inc_on, inc_l, inc_t, inc_r, inc_b (كنسب من 0 إلى 1)
 }
+
+class RegionPref(val on: Boolean, val l: Float, val t: Float, val r: Float, val b: Float)
 
 data class AppSettings(
     val src: String,
     val tgt: String,
-    val region: Int,
     val interval: Long,
     val refresh: Long,
+    val ttl: Long,
     val opacity: Int,
-    val smart: Boolean
+    val smart: Boolean,
+    val strict: Boolean,
+    val conf: Int,
+    val scale: Int,
+    val inc: RegionPref,
+    val exc: RegionPref,
+    val glossary: Map<String, String>
+)
+
+private fun loadRegion(p: SharedPreferences, key: String) = RegionPref(
+    p.getBoolean("${key}_on", false),
+    p.getFloat("${key}_l", 0.2f), p.getFloat("${key}_t", 0.2f),
+    p.getFloat("${key}_r", 0.8f), p.getFloat("${key}_b", 0.8f)
 )
 
 fun loadSettings(ctx: Context): AppSettings {
     val p = ctx.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+    val gl = HashMap<String, String>()
+    for (line in (p.getString(Prefs.GLOSSARY, "") ?: "").lines()) {
+        val i = line.indexOf('=')
+        if (i > 0) {
+            val k = line.substring(0, i).trim().lowercase()
+            val v = line.substring(i + 1).trim()
+            if (k.isNotEmpty() && v.isNotEmpty()) gl[k] = v
+        }
+    }
     return AppSettings(
         src = p.getString(Prefs.SRC, "en") ?: "en",
         tgt = p.getString(Prefs.TGT, "ar") ?: "ar",
-        region = p.getInt(Prefs.REGION, 0),
         interval = p.getInt(Prefs.INTERVAL, 1000).toLong(),
         refresh = p.getInt(Prefs.REFRESH, 4000).toLong(),
+        ttl = p.getInt(Prefs.TTL, 0).toLong(),
         opacity = p.getInt(Prefs.OPACITY, 90),
-        smart = p.getBoolean(Prefs.SMART, true)
+        smart = p.getBoolean(Prefs.SMART, true),
+        strict = p.getBoolean(Prefs.STRICT, false),
+        conf = p.getInt(Prefs.CONF, 70),
+        scale = p.getInt(Prefs.SCALE, 100),
+        inc = loadRegion(p, "inc"),
+        exc = loadRegion(p, "exc"),
+        glossary = gl
     )
+}
+
+// ---------- أداة تحديد المنطقة على الشاشة ----------
+
+private class PickerView(
+    ctx: Context, private val accent: Int, private val W: Int, private val H: Int
+) : View(ctx) {
+    var l = 0f; var t = 0f; var r = 0f; var b = 0f
+    var fine = false
+    private var mode = 0 // 1 = تحريك، وإلا مجموع: 2 يسار، 4 أعلى، 8 يمين، 16 أسفل
+    private var lx = 0f
+    private var ly = 0f
+    private val MIN = 30f
+    private val dim = Paint().apply { color = 0x99000000.toInt() }
+    private val stroke = Paint().apply {
+        style = Paint.Style.STROKE; strokeWidth = 5f; color = accent
+    }
+    private val fill = Paint().apply { color = accent }
+    private val txt = Paint().apply { color = Color.WHITE; textSize = 34f; isAntiAlias = true }
+
+    fun setRect(a: Float, b2: Float, c: Float, d: Float) { l = a; t = b2; r = c; b = d; invalidate() }
+
+    fun fracs() = floatArrayOf(l / W, t / H, r / W, b / H)
+
+    private fun hit(x: Float, y: Float): Int {
+        val tol = 70f
+        val inV = y > t - tol && y < b + tol
+        val inH = x > l - tol && x < r + tol
+        var m = 0
+        if (inV && abs(x - l) < tol) m = m or 2
+        if (inV && abs(x - r) < tol) m = m or 8
+        if (inH && abs(y - t) < tol) m = m or 4
+        if (inH && abs(y - b) < tol) m = m or 16
+        if (m != 0) return m
+        if (x in l..r && y in t..b) return 1
+        return 0
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lx = e.x; ly = e.y
+                mode = hit(e.x, e.y)
+                if (mode == 0) { // رسم منطقة جديدة
+                    l = e.x; t = e.y; r = e.x + 1; b = e.y + 1
+                    mode = 8 or 16
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val s = if (fine) 0.25f else 1f
+                val dx = (e.x - lx) * s
+                val dy = (e.y - ly) * s
+                lx = e.x; ly = e.y
+                if (mode == 1) {
+                    val w0 = r - l; val h0 = b - t
+                    l = (l + dx).coerceIn(0f, W - w0)
+                    t = (t + dy).coerceIn(0f, H - h0)
+                    r = l + w0; b = t + h0
+                } else {
+                    if ((mode and 2) != 0) l += dx
+                    if ((mode and 4) != 0) t += dy
+                    if ((mode and 8) != 0) r += dx
+                    if ((mode and 16) != 0) b += dy
+                    l = l.coerceIn(0f, W.toFloat()); r = r.coerceIn(0f, W.toFloat())
+                    t = t.coerceIn(0f, H.toFloat()); b = b.coerceIn(0f, H.toFloat())
+                    if (r - l < MIN) { if ((mode and 2) != 0) l = r - MIN else r = l + MIN }
+                    if (b - t < MIN) { if ((mode and 4) != 0) t = b - MIN else b = t + MIN }
+                }
+                invalidate()
+            }
+        }
+        return true
+    }
+
+    override fun onDraw(c: Canvas) {
+        val w = W.toFloat(); val h = H.toFloat()
+        c.drawRect(0f, 0f, w, t, dim)
+        c.drawRect(0f, b, w, h, dim)
+        c.drawRect(0f, t, l, b, dim)
+        c.drawRect(r, t, w, b, dim)
+        c.drawRect(l, t, r, b, stroke)
+        val mx = (l + r) / 2; val my = (t + b) / 2
+        for (p in listOf(l to t, r to t, l to b, r to b, mx to t, mx to b, l to my, r to my)) {
+            c.drawCircle(p.first, p.second, 14f, fill)
+        }
+        val info = "${(r - l).toInt()} × ${(b - t).toInt()} px   |   x=${l.toInt()}  y=${t.toInt()}"
+        c.drawText(info, 30f, 190f, txt)
+    }
 }
 
 // ---------- الخدمة ----------
@@ -88,7 +215,7 @@ fun loadSettings(ctx: Context): AppSettings {
 class TranslateService : Service() {
 
     private class Cand(val box: Rect, val src: String, val lines: Int)
-    private class Tracked(val src: String, val rect: Rect, val view: TextView)
+    private class Tracked(val src: String, val rect: Rect, val view: TextView, var seen: Long)
 
     private val PAD = 6
 
@@ -104,8 +231,11 @@ class TranslateService : Service() {
     private var dpi = 0
 
     private var overlayRoot: FrameLayout? = null
-    private var button: TextView? = null
-    private var buttonParams: WindowManager.LayoutParams? = null
+    private var bar: LinearLayout? = null
+    private var barParams: WindowManager.LayoutParams? = null
+    private var toggleView: TextView? = null
+    private var pickerRoot: View? = null
+    private var pickerOpen = false
 
     private var auto = false
     private var busy = false
@@ -122,7 +252,7 @@ class TranslateService : Service() {
         LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.5f).build()
     )
 
-    private val tick = Runnable { if (auto && !busy) cycle() }
+    private val tick = Runnable { if (auto && !busy && !pickerOpen) cycle() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -142,9 +272,9 @@ class TranslateService : Service() {
             }, handler)
         }
         setupCapture()
-        addOverlayRoot()   // أولاً، ليبقى الزر فوقه
-        addButton()
-        toast("جاهز. اضغط الزر العائم لبدء الترجمة")
+        addOverlayRoot()   // أولاً، ليبقى الشريط فوقه
+        addBar()
+        toast("جاهز. اضغط ▶ في الشريط العائم لبدء الترجمة")
         return START_NOT_STICKY
     }
 
@@ -193,12 +323,17 @@ class TranslateService : Service() {
 
     private fun next() {
         busy = false
-        if (auto) handler.postDelayed(tick, cfg.interval)
+        if (auto) handler.postDelayed(tick, max(200L, cfg.interval))
     }
+
+    private fun sameRegion(a: RegionPref, b: RegionPref) =
+        a.on == b.on && a.l == b.l && a.t == b.t && a.r == b.r && a.b == b.b
 
     private fun refreshSettings() {
         val n = loadSettings(this)
-        if (n.src != cfg.src || n.tgt != cfg.tgt) {
+        if (n.src != cfg.src || n.tgt != cfg.tgt ||
+            !sameRegion(n.inc, cfg.inc) || !sameRegion(n.exc, cfg.exc) || n.glossary != cfg.glossary
+        ) {
             removeAllTracked()
             cache.clear(); ignore.clear(); inflight.clear()
         }
@@ -210,8 +345,19 @@ class TranslateService : Service() {
         refreshSettings()
         syncSize()
         val now = SystemClock.uptimeMillis()
-        // فحص "نظيف" دوري: نخفي الترجمة لحظة ليرى الـ OCR النص الأصلي ونتأكد أنه لم يتغير
-        val clean = tracked.isNotEmpty() && now - lastValidation >= cfg.refresh
+
+        // انتهاء عمر الترجمة (إن حدّدت ذلك)
+        if (cfg.ttl > 0) {
+            for (i in tracked.indices.reversed()) {
+                if (now - tracked[i].seen > cfg.ttl) {
+                    overlayRoot?.removeView(tracked[i].view)
+                    tracked.removeAt(i)
+                }
+            }
+        }
+
+        // فحص "نظيف" دوري: نخفي الترجمة لحظة ليرى الـ OCR النص الأصلي
+        val clean = cfg.refresh > 0 && tracked.isNotEmpty() && now - lastValidation >= cfg.refresh
         if (clean) {
             lastValidation = now
             overlayRoot?.alpha = 0f
@@ -233,10 +379,19 @@ class TranslateService : Service() {
         }
     }
 
+    /** يحوّل نسب المنطقة المحفوظة إلى بكسلات الشاشة */
+    private fun rectOf(r: RegionPref): Rect {
+        val left = (r.l * w).toInt().coerceIn(0, w - 2)
+        val top = (r.t * h).toInt().coerceIn(0, h - 2)
+        val right = (r.r * w).toInt().coerceIn(left + 2, w)
+        val bottom = (r.b * h).toInt().coerceIn(top + 2, h)
+        return Rect(left, top, right, bottom)
+    }
+
     private fun grab(tries: Int, clean: Boolean) {
         val img = reader?.acquireLatestImage()
         if (img == null) {
-            // لا إطار جديد: في الفحص العادي معناها أن الشاشة ثابتة، فلا داعي للعمل
+            // لا إطار جديد: في الفحص العادي معناها أن الشاشة ثابتة
             if (clean && tries < 5) {
                 handler.postDelayed({ grab(tries + 1, true) }, 100)
             } else {
@@ -254,20 +409,26 @@ class TranslateService : Service() {
         img.close()
         overlayRoot?.alpha = 1f
 
-        val top = when (cfg.region) {
-            1 -> bmp.height / 2
-            2 -> bmp.height * 2 / 3
-            else -> 0
+        val inc = if (cfg.inc.on) rectOf(cfg.inc) else Rect(0, 0, w, h)
+        val cx = min(inc.left, bmp.width - 2)
+        val cy = min(inc.top, bmp.height - 2)
+        val cw = max(2, min(inc.width(), bmp.width - cx))
+        val ch = max(2, min(inc.height(), bmp.height - cy))
+        var part = Bitmap.createBitmap(bmp, cx, cy, cw, ch)
+        val k = cfg.scale / 100f
+        if (k < 0.99f) {
+            part = Bitmap.createScaledBitmap(
+                part, max(1, (cw * k).toInt()), max(1, (ch * k).toInt()), true
+            )
         }
-        val part = if (top > 0) Bitmap.createBitmap(bmp, 0, top, bmp.width, bmp.height - top) else bmp
 
         recognizer().process(InputImage.fromBitmap(part, 0))
-            .addOnSuccessListener { handleText(it, clean, top) }
+            .addOnSuccessListener { handleText(it, clean, cx, cy, k) }
             .addOnFailureListener { next() }
     }
 
-    private fun buttonRect(): Rect? {
-        val b = button ?: return null
+    private fun barRect(): Rect? {
+        val b = bar ?: return null
         val loc = IntArray(2)
         b.getLocationOnScreen(loc)
         return Rect(loc[0], loc[1], loc[0] + b.width, loc[1] + b.height)
@@ -282,20 +443,32 @@ class TranslateService : Service() {
 
     private fun grow(r: Rect): Rect = Rect(r).apply { inset(-PAD, -PAD) }
 
-    private fun handleText(t: Text, clean: Boolean, offY: Int) {
+    private fun handleText(t: Text, clean: Boolean, offX: Int, offY: Int, k: Float) {
         if (!auto) { busy = false; return }
-        val btn = buttonRect()
+        val btn = barRect()
+        val exc = if (cfg.exc.on) rectOf(cfg.exc) else null
+        val minConf = cfg.conf / 100f
         val cands = ArrayList<Cand>()
         for (b in t.textBlocks) {
             val bb = b.boundingBox ?: continue
-            val box = Rect(bb).apply { offset(0, offY) }
+            val box = Rect(
+                (bb.left / k).toInt() + offX, (bb.top / k).toInt() + offY,
+                (bb.right / k).toInt() + offX, (bb.bottom / k).toInt() + offY
+            )
             val src = b.text.replace("\n", " ").trim()
             if (!validText(src)) continue
             if (ignore.contains(src.lowercase())) continue
             if (btn != null && Rect.intersects(btn, box)) continue
+            if (exc != null && coverage(box, exc) > 0.3f) continue
+            // ثقة القراءة: نتجاهل النصوص المشوّشة (رسوم الجدران والأشكال العشوائية)
+            if (b.lines.isNotEmpty()) {
+                val conf = b.lines.map { it.confidence }.average().toFloat()
+                if (conf > 0f && conf < minConf) continue
+            }
             cands.add(Cand(box, src, b.lines.size))
         }
 
+        val now = SystemClock.uptimeMillis()
         if (!clean) {
             // فحص عادي: نبحث فقط عن نص جديد لم يُغطَّ بترجمة بعد
             val fresh = cands.filter { c -> tracked.none { coverage(c.box, it.rect) > 0.4f } }
@@ -312,7 +485,7 @@ class TranslateService : Service() {
                         m = i; break
                     }
                 }
-                if (m >= 0) keep[m] = true else toAdd.add(c)
+                if (m >= 0) { keep[m] = true; tracked[m].seen = now } else toAdd.add(c)
             }
             for (i in tracked.indices.reversed()) {
                 if (!keep[i]) {
@@ -342,6 +515,9 @@ class TranslateService : Service() {
     /** النتيجة: نص مترجم، أو "" = تجاهل هذا النص نهائياً، أو null = فشل مؤقت */
     private fun translateAsync(src: String, cb: (String?) -> Unit) {
         val s = cfg
+        // القاموس المخصص أولاً
+        s.glossary[src.lowercase().trim()]?.let { cb(it); return }
+
         val key = "${s.src}|${s.tgt}|$src"
         cache[key]?.let { cb(it); return }
 
@@ -374,13 +550,15 @@ class TranslateService : Service() {
                 }
         }
 
-        if (s.src == "auto" || s.smart) {
+        if (s.src == "auto" || s.smart || s.strict) {
             identifier.identifyLanguage(src)
                 .addOnSuccessListener { code ->
                     if (s.src == "auto") {
                         if (code == "und" || code == s.tgt) cb("") else doTranslate(code)
+                    } else if (s.strict) {
+                        // صارم: لا نترجم إلا إذا تأكد الكشف أن النص بلغة اللعبة
+                        if (code != s.src) cb("") else doTranslate(s.src)
                     } else {
-                        // فلتر ذكي: تجاهل النص إذا كان بلغة أخرى غير لغة اللعبة
                         if (code != "und" && code != s.src) cb("") else doTranslate(s.src)
                     }
                 }
@@ -412,7 +590,7 @@ class TranslateService : Service() {
             topMargin = rect.top
         }
         root.addView(tv, lp)
-        tracked.add(Tracked(c.src, rect, tv))
+        tracked.add(Tracked(c.src, rect, tv, SystemClock.uptimeMillis()))
     }
 
     private fun removeAllTracked() {
@@ -440,9 +618,9 @@ class TranslateService : Service() {
         overlayRoot = root
     }
 
-    // ---------- الزر العائم ----------
+    // ---------- الشريط العائم ----------
 
-    private fun addButton() {
+    private fun addBar() {
         val bp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -450,16 +628,27 @@ class TranslateService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; x = 20; y = 300 }
-        buttonParams = bp
+        barParams = bp
 
-        val b = TextView(this).apply {
-            text = "ترجمة تلقائية"
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0xCC1565C0.toInt())
-            textSize = 16f
-            setPadding(36, 24, 36, 24)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xDD1565C0.toInt())
         }
-        b.setOnTouchListener(object : View.OnTouchListener {
+        fun cell(t: String) = TextView(this).apply {
+            text = t
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setPadding(26, 20, 26, 20)
+        }
+        val toggle = cell("▶ ترجمة")
+        toggleView = toggle
+        row.addView(toggle)
+        row.addView(cell("منطقة"))
+        row.addView(cell("استبعاد"))
+        row.addView(cell("⚙"))
+
+        row.setOnTouchListener(object : View.OnTouchListener {
             var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
@@ -471,26 +660,131 @@ class TranslateService : Service() {
                         if (abs(dx) > 10 || abs(dy) > 10) moved = true
                         if (moved) { bp.x = sx + dx; bp.y = sy + dy; wm.updateViewLayout(v, bp) }
                     }
-                    MotionEvent.ACTION_UP -> if (!moved) onTap()
+                    MotionEvent.ACTION_UP -> if (!moved) {
+                        val x = e.x.toInt()
+                        for (i in 0 until row.childCount) {
+                            val c = row.getChildAt(i)
+                            if (x >= c.left && x < c.right) { onBarAction(i); break }
+                        }
+                    }
                 }
                 return true
             }
         })
-        button = b
-        wm.addView(b, bp)
+        bar = row
+        wm.addView(row, bp)
+    }
+
+    private fun onBarAction(i: Int) {
+        when (i) {
+            0 -> onTap()
+            1 -> openPicker("inc")
+            2 -> openPicker("exc")
+            3 -> startActivity(
+                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
     }
 
     private fun onTap() {
         auto = !auto
         if (auto) {
-            button?.text = "■ إيقاف"
+            toggleView?.text = "■ إيقاف"
             handler.post(tick)
         } else {
             handler.removeCallbacks(tick)
             inflight.clear()
             removeAllTracked()
-            button?.text = "ترجمة تلقائية"
+            toggleView?.text = "▶ ترجمة"
         }
+    }
+
+    // ---------- تحديد المنطقة ----------
+
+    private fun openPicker(key: String) {
+        if (pickerOpen) return
+        pickerOpen = true
+        removeAllTracked()
+        val dm = screen()
+        val accent = if (key == "inc") 0xFF2ECC71.toInt() else 0xFFE74C3C.toInt()
+        val saved = if (key == "inc") cfg.inc else cfg.exc
+        val pv = PickerView(this, accent, dm.widthPixels, dm.heightPixels)
+        pv.setRect(
+            saved.l * dm.widthPixels, saved.t * dm.heightPixels,
+            saved.r * dm.widthPixels, saved.b * dm.heightPixels
+        )
+
+        val root = FrameLayout(this)
+        root.addView(pv, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+
+        fun btn(t: String, bg: Int, click: () -> Unit) = TextView(this).apply {
+            text = t
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setPadding(30, 20, 30, 20)
+            setBackgroundColor(bg)
+            setOnClickListener { click() }
+        }
+        val prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val fineBtn = btn("دقة عالية: لا", 0xFF555555.toInt()) {}
+        fineBtn.setOnClickListener {
+            pv.fine = !pv.fine
+            fineBtn.text = if (pv.fine) "دقة عالية: نعم" else "دقة عالية: لا"
+        }
+        val items = listOf(
+            btn("✓ تأكيد", 0xFF2E7D32.toInt()) {
+                val f = pv.fracs()
+                prefs.edit().putBoolean("${key}_on", true)
+                    .putFloat("${key}_l", f[0]).putFloat("${key}_t", f[1])
+                    .putFloat("${key}_r", f[2]).putFloat("${key}_b", f[3]).apply()
+                closePicker()
+            },
+            btn("✕ إلغاء", 0xFF555555.toInt()) { closePicker() },
+            btn("إزالة المنطقة", 0xFF8E2A2A.toInt()) {
+                prefs.edit().putBoolean("${key}_on", false).apply()
+                closePicker()
+            },
+            fineBtn
+        )
+        for (v in items) {
+            row.addView(v, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(6, 0, 6, 0) })
+        }
+        root.addView(row, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        ).apply { topMargin = 60 })
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        wm.addView(root, lp)
+        pickerRoot = root
+        toast(if (key == "inc") "اسحب لرسم منطقة الترجمة" else "اسحب لرسم منطقة الاستبعاد")
+    }
+
+    private fun closePicker() {
+        pickerRoot?.let { runCatching { wm.removeView(it) } }
+        pickerRoot = null
+        pickerOpen = false
+        cfg = loadSettings(this)
+        if (auto) handler.post(tick)
     }
 
     // ---------- أدوات مساعدة ----------
@@ -538,8 +832,9 @@ class TranslateService : Service() {
     override fun onDestroy() {
         auto = false
         handler.removeCallbacksAndMessages(null)
+        pickerRoot?.let { runCatching { wm.removeView(it) } }
         overlayRoot?.let { runCatching { wm.removeView(it) } }
-        button?.let { runCatching { wm.removeView(it) } }
+        bar?.let { runCatching { wm.removeView(it) } }
         vd?.release()
         reader?.close()
         projection?.stop()

@@ -4,7 +4,7 @@ set -e
 D=app/src/main/java/com/example/gametranslator
 R=app/src/main/res
 mkdir -p $D $R/mipmap-anydpi-v26 $R/drawable $R/values
-mv MainActivity.kt TranslateService.kt $D/
+mv *.kt $D/
 mv AndroidManifest.xml app/src/main/AndroidManifest.xml
 
 cat > settings.gradle.kts << 'EOF'
@@ -52,8 +52,8 @@ android {
         applicationId = "com.example.gametranslator"
         minSdk = 30
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     compileOptions {

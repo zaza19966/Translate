@@ -4,6 +4,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -14,6 +16,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -23,6 +26,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.speech.tts.TextToSpeech
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
@@ -47,166 +51,79 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-// ---------- الإعدادات المشتركة بين الشاشة والخدمة ----------
+// ---------- إطار الشاشة العائمة (حدود + مقابض) ----------
 
-object Prefs {
-    const val NAME = "settings"
-    const val SRC = "src"            // "auto" أو رمز لغة
-    const val TGT = "tgt"
-    const val INTERVAL = "interval"  // فاصل الفحص (مللي ثانية)
-    const val REFRESH = "refresh"    // فاصل التحقق من تغيّر النص (0 = إيقاف)
-    const val TTL = "ttl"            // عمر الترجمة على الشاشة (0 = بلا حد)
-    const val OPACITY = "opacity"    // عتمة الخلفية 40..100
-    const val SMART = "smart"        // فلتر اللغة
-    const val STRICT = "strict"      // فلتر لغة صارم
-    const val CONF = "conf"          // حد ثقة القراءة 0..95
-    const val SCALE = "scale"        // جودة الفحص 40..100
-    const val GLOSSARY = "glossary"  // قاموس مخصص: نص=ترجمة
-    // المناطق: "inc" = منطقة الترجمة، "exc" = منطقة الاستبعاد
-    // مفاتيحها: inc_on, inc_l, inc_t, inc_r, inc_b (كنسب من 0 إلى 1)
-}
-
-class RegionPref(val on: Boolean, val l: Float, val t: Float, val r: Float, val b: Float)
-
-data class AppSettings(
-    val src: String,
-    val tgt: String,
-    val interval: Long,
-    val refresh: Long,
-    val ttl: Long,
-    val opacity: Int,
-    val smart: Boolean,
-    val strict: Boolean,
-    val conf: Int,
-    val scale: Int,
-    val inc: RegionPref,
-    val exc: RegionPref,
-    val glossary: Map<String, String>
-)
-
-private fun loadRegion(p: SharedPreferences, key: String) = RegionPref(
-    p.getBoolean("${key}_on", false),
-    p.getFloat("${key}_l", 0.2f), p.getFloat("${key}_t", 0.2f),
-    p.getFloat("${key}_r", 0.8f), p.getFloat("${key}_b", 0.8f)
-)
-
-fun loadSettings(ctx: Context): AppSettings {
-    val p = ctx.getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
-    val gl = HashMap<String, String>()
-    for (line in (p.getString(Prefs.GLOSSARY, "") ?: "").lines()) {
-        val i = line.indexOf('=')
-        if (i > 0) {
-            val k = line.substring(0, i).trim().lowercase()
-            val v = line.substring(i + 1).trim()
-            if (k.isNotEmpty() && v.isNotEmpty()) gl[k] = v
-        }
-    }
-    return AppSettings(
-        src = p.getString(Prefs.SRC, "en") ?: "en",
-        tgt = p.getString(Prefs.TGT, "ar") ?: "ar",
-        interval = p.getInt(Prefs.INTERVAL, 1000).toLong(),
-        refresh = p.getInt(Prefs.REFRESH, 4000).toLong(),
-        ttl = p.getInt(Prefs.TTL, 0).toLong(),
-        opacity = p.getInt(Prefs.OPACITY, 90),
-        smart = p.getBoolean(Prefs.SMART, true),
-        strict = p.getBoolean(Prefs.STRICT, false),
-        conf = p.getInt(Prefs.CONF, 70),
-        scale = p.getInt(Prefs.SCALE, 100),
-        inc = loadRegion(p, "inc"),
-        exc = loadRegion(p, "exc"),
-        glossary = gl
-    )
-}
-
-// ---------- أداة تحديد المنطقة على الشاشة ----------
-
-private class PickerView(
-    ctx: Context, private val accent: Int, private val W: Int, private val H: Int
-) : View(ctx) {
-    var l = 0f; var t = 0f; var r = 0f; var b = 0f
+private class ZoneFrameView(ctx: Context) : View(ctx) {
+    var accent = 0xFF2ECC71.toInt()
+    var editing = false
+    var zoneEnabled = true
     var fine = false
+    var onDrag: ((Int, Float, Float) -> Unit)? = null
+    var onDone: (() -> Unit)? = null
+
     private var mode = 0 // 1 = تحريك، وإلا مجموع: 2 يسار، 4 أعلى، 8 يمين، 16 أسفل
     private var lx = 0f
     private var ly = 0f
-    private val MIN = 30f
-    private val dim = Paint().apply { color = 0x99000000.toInt() }
-    private val stroke = Paint().apply {
-        style = Paint.Style.STROKE; strokeWidth = 5f; color = accent
+    private val border = Paint().apply { style = Paint.Style.STROKE }
+    private val fillP = Paint()
+    private val tint = Paint().apply { color = 0x2AFFFFFF }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w < 40f || h < 40f) return
+        val col = if (zoneEnabled) accent else 0xFF888888.toInt()
+        border.color = col
+        border.strokeWidth = if (editing) 6f else 3f
+        if (editing) c.drawRect(0f, 0f, w, h, tint)
+        c.drawRect(3f, 3f, w - 3f, h - 3f, border)
+        if (editing) {
+            fillP.color = col
+            val mx = w / 2
+            val my = h / 2
+            val pts = listOf(0f to 0f, w to 0f, 0f to h, w to h, mx to 0f, mx to h, 0f to my, w to my)
+            for (p in pts) {
+                c.drawCircle(p.first.coerceIn(14f, w - 14f), p.second.coerceIn(14f, h - 14f), 14f, fillP)
+            }
+        }
     }
-    private val fill = Paint().apply { color = accent }
-    private val txt = Paint().apply { color = Color.WHITE; textSize = 34f; isAntiAlias = true }
-
-    fun setRect(a: Float, b2: Float, c: Float, d: Float) { l = a; t = b2; r = c; b = d; invalidate() }
-
-    fun fracs() = floatArrayOf(l / W, t / H, r / W, b / H)
 
     private fun hit(x: Float, y: Float): Int {
-        val tol = 70f
-        val inV = y > t - tol && y < b + tol
-        val inH = x > l - tol && x < r + tol
+        val tol = 60f
         var m = 0
-        if (inV && abs(x - l) < tol) m = m or 2
-        if (inV && abs(x - r) < tol) m = m or 8
-        if (inH && abs(y - t) < tol) m = m or 4
-        if (inH && abs(y - b) < tol) m = m or 16
-        if (m != 0) return m
-        if (x in l..r && y in t..b) return 1
-        return 0
+        if (x < tol) m = m or 2
+        if (x > width - tol) m = m or 8
+        if (y < tol) m = m or 4
+        if (y > height - tol) m = m or 16
+        return if (m != 0) m else 1
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!editing) return false
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                lx = e.x; ly = e.y
                 mode = hit(e.x, e.y)
-                if (mode == 0) { // رسم منطقة جديدة
-                    l = e.x; t = e.y; r = e.x + 1; b = e.y + 1
-                    mode = 8 or 16
-                }
+                lx = e.rawX; ly = e.rawY
             }
             MotionEvent.ACTION_MOVE -> {
                 val s = if (fine) 0.25f else 1f
-                val dx = (e.x - lx) * s
-                val dy = (e.y - ly) * s
-                lx = e.x; ly = e.y
-                if (mode == 1) {
-                    val w0 = r - l; val h0 = b - t
-                    l = (l + dx).coerceIn(0f, W - w0)
-                    t = (t + dy).coerceIn(0f, H - h0)
-                    r = l + w0; b = t + h0
-                } else {
-                    if ((mode and 2) != 0) l += dx
-                    if ((mode and 4) != 0) t += dy
-                    if ((mode and 8) != 0) r += dx
-                    if ((mode and 16) != 0) b += dy
-                    l = l.coerceIn(0f, W.toFloat()); r = r.coerceIn(0f, W.toFloat())
-                    t = t.coerceIn(0f, H.toFloat()); b = b.coerceIn(0f, H.toFloat())
-                    if (r - l < MIN) { if ((mode and 2) != 0) l = r - MIN else r = l + MIN }
-                    if (b - t < MIN) { if ((mode and 4) != 0) t = b - MIN else b = t + MIN }
-                }
-                invalidate()
+                val dx = (e.rawX - lx) * s
+                val dy = (e.rawY - ly) * s
+                lx = e.rawX; ly = e.rawY
+                onDrag?.invoke(mode, dx, dy)
             }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onDone?.invoke()
         }
         return true
-    }
-
-    override fun onDraw(c: Canvas) {
-        val w = W.toFloat(); val h = H.toFloat()
-        c.drawRect(0f, 0f, w, t, dim)
-        c.drawRect(0f, b, w, h, dim)
-        c.drawRect(0f, t, l, b, dim)
-        c.drawRect(r, t, w, b, dim)
-        c.drawRect(l, t, r, b, stroke)
-        val mx = (l + r) / 2; val my = (t + b) / 2
-        for (p in listOf(l to t, r to t, l to b, r to b, mx to t, mx to b, l to my, r to my)) {
-            c.drawCircle(p.first, p.second, 14f, fill)
-        }
-        val info = "${(r - l).toInt()} × ${(b - t).toInt()} px   |   x=${l.toInt()}  y=${t.toInt()}"
-        c.drawText(info, 30f, 190f, txt)
     }
 }
 
@@ -217,9 +134,31 @@ class TranslateService : Service() {
     private class Cand(val box: Rect, val src: String, val lines: Int)
     private class Tracked(val src: String, val rect: Rect, val view: TextView, var seen: Long)
 
+    private class ZoneRt(var cfg: Zone, val container: FrameLayout) {
+        val tracked = ArrayList<Tracked>()
+        val inflight = HashSet<String>()
+        var nextScan = 0L
+        var lastValidation = 0L
+        val rect = RectF()
+        var editing = false
+        var fine = false
+        var frame: ZoneFrameView? = null
+        var frameLp: WindowManager.LayoutParams? = null
+        var strip: LinearLayout? = null
+        var stripLp: WindowManager.LayoutParams? = null
+        var cellName: TextView? = null
+        var cellToggle: TextView? = null
+        var cellEdit: TextView? = null
+        var cellFine: TextView? = null
+    }
+
     private val PAD = 6
+    private val FLAGS_BASE = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
     private lateinit var wm: WindowManager
+    private lateinit var prefs: SharedPreferences
     private lateinit var cfg: AppSettings
     private val handler = Handler(Looper.getMainLooper())
 
@@ -233,34 +172,48 @@ class TranslateService : Service() {
     private var overlayRoot: FrameLayout? = null
     private var bar: LinearLayout? = null
     private var barParams: WindowManager.LayoutParams? = null
-    private var toggleView: TextView? = null
-    private var pickerRoot: View? = null
-    private var pickerOpen = false
+    private var toggleCell: TextView? = null
+    private lateinit var defaultRt: ZoneRt
+    private val zonesRt = ArrayList<ZoneRt>()
+    private var pendingEdit: String? = null
 
+    private var started = false
     private var auto = false
     private var busy = false
-    private var lastValidation = 0L
     private var toastedDownload = false
+    private var lastFg: String? = null
+    private var autoByApp = false
+    private var lastLogged = ""
 
-    private val tracked = ArrayList<Tracked>()
-    private val inflight = HashSet<String>()
-    private val ignore = HashSet<String>()
-    private val cache = HashMap<String, String>()
+    private val cache = HashMap<String, String>()   // "" = تجاهل هذا النص
     private val translators = HashMap<String, Translator>()
     private val recognizers = HashMap<String, TextRecognizer>()
     private val identifier = LanguageIdentification.getClient(
         LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.5f).build()
     )
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
 
-    private val tick = Runnable { if (auto && !busy && !pickerOpen) cycle() }
+    private val tick = Runnable { if (auto && !busy) cycle() }
+    private val watcher = object : Runnable {
+        override fun run() {
+            checkForeground()
+            handler.postDelayed(this, 2000)
+        }
+    }
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == Prefs.ZONES) syncZones()
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (started) return START_NOT_STICKY
         val data = intent?.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
         val code = intent.getIntExtra("code", 0)
         wm = getSystemService(WindowManager::class.java)
+        prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
         cfg = loadSettings(this)
 
         startForeground(1, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -272,8 +225,14 @@ class TranslateService : Service() {
             }, handler)
         }
         setupCapture()
-        addOverlayRoot()   // أولاً، ليبقى الشريط فوقه
+        addOverlayRoot()
+        defaultRt = ZoneRt(Zone("default", "", 0f, 0f, 1f, 1f, true, 0, "", "", 0L), newContainer())
         addBar()
+        tts = TextToSpeech(this) { st -> ttsReady = (st == TextToSpeech.SUCCESS) }
+        prefs.registerOnSharedPreferenceChangeListener(prefListener)
+        syncZones()
+        handler.postDelayed(watcher, 2000)
+        started = true
         toast("جاهز. اضغط ▶ في الشريط العائم لبدء الترجمة")
         return START_NOT_STICKY
     }
@@ -315,60 +274,87 @@ class TranslateService : Service() {
             reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
             vd?.resize(w, h, dpi)
             vd?.surface = reader!!.surface
-            removeAllTracked()
+            clearAllTracked()
+            for (z in zonesRt) {
+                z.rect.set(z.cfg.l * w, z.cfg.t * h, z.cfg.r * w, z.cfg.b * h)
+                applyRect(z)
+            }
         }
     }
 
     // ---------- الحلقة التلقائية ----------
 
-    private fun next() {
-        busy = false
-        if (auto) handler.postDelayed(tick, max(200L, cfg.interval))
+    private fun setAuto(on: Boolean) {
+        auto = on
+        toggleCell?.text = if (on) "■ إيقاف" else "▶ ترجمة"
+        if (on) {
+            handler.post(tick)
+        } else {
+            handler.removeCallbacks(tick)
+            clearAllTracked()
+        }
     }
-
-    private fun sameRegion(a: RegionPref, b: RegionPref) =
-        a.on == b.on && a.l == b.l && a.t == b.t && a.r == b.r && a.b == b.b
 
     private fun refreshSettings() {
         val n = loadSettings(this)
-        if (n.src != cfg.src || n.tgt != cfg.tgt ||
-            !sameRegion(n.inc, cfg.inc) || !sameRegion(n.exc, cfg.exc) || n.glossary != cfg.glossary
+        if (n.src != cfg.src || n.tgt != cfg.tgt || n.glossary != cfg.glossary ||
+            n.cloud != cfg.cloud || n.model != cfg.model
         ) {
-            removeAllTracked()
-            cache.clear(); ignore.clear(); inflight.clear()
+            clearAllTracked()
+            cache.clear()
         }
         cfg = n
     }
 
+    private fun effSrc(z: ZoneRt) = z.cfg.src.ifEmpty { cfg.src }
+    private fun effTgt(z: ZoneRt) = z.cfg.tgt.ifEmpty { cfg.tgt }
+    private fun intervalOf(z: ZoneRt) =
+        max(200L, if (z.cfg.interval > 0) z.cfg.interval else cfg.interval)
+
+    private fun activeZones(): List<ZoneRt> {
+        val tz = zonesRt.filter { it.cfg.mode == 0 }
+        if (tz.isEmpty()) return listOf(defaultRt)
+        return tz.filter { it.cfg.enabled && !it.editing }
+    }
+
     private fun cycle() {
-        busy = true
         refreshSettings()
         syncSize()
         val now = SystemClock.uptimeMillis()
-
-        // انتهاء عمر الترجمة (إن حدّدت ذلك)
-        if (cfg.ttl > 0) {
-            for (i in tracked.indices.reversed()) {
-                if (now - tracked[i].seen > cfg.ttl) {
-                    overlayRoot?.removeView(tracked[i].view)
-                    tracked.removeAt(i)
-                }
-            }
+        val due = activeZones().filter { it.nextScan <= now }
+        if (due.isEmpty()) {
+            handler.postDelayed(tick, 100)
+            return
         }
+        busy = true
+        if (cfg.ttl > 0) for (z in due) expireTtl(z, now)
 
-        // فحص "نظيف" دوري: نخفي الترجمة لحظة ليرى الـ OCR النص الأصلي
-        val clean = cfg.refresh > 0 && tracked.isNotEmpty() && now - lastValidation >= cfg.refresh
-        if (clean) {
-            lastValidation = now
-            overlayRoot?.alpha = 0f
-            handler.postDelayed({ grab(0, true) }, 130)
+        // فحص "نظيف" دوري: نخفي ترجمة تلك الشاشة لحظة ليرى الـ OCR النص الأصلي
+        val clean = due.filter {
+            cfg.refresh > 0 && it.tracked.isNotEmpty() && now - it.lastValidation >= cfg.refresh
+        }
+        if (clean.isNotEmpty()) {
+            for (z in clean) { z.lastValidation = now; z.container.alpha = 0f }
+            handler.postDelayed({ grab(0, due, clean) }, 130)
         } else {
-            grab(0, false)
+            grab(0, due, clean)
         }
     }
 
-    private fun recognizer(): TextRecognizer {
-        val key = when (cfg.src) { "ja" -> "ja"; "ko" -> "ko"; "zh" -> "zh"; else -> "latin" }
+    private fun finishCycle(due: List<ZoneRt>) {
+        val now = SystemClock.uptimeMillis()
+        for (z in due) z.nextScan = now + intervalOf(z)
+        busy = false
+        if (auto) handler.postDelayed(tick, 100)
+    }
+
+    private fun showContainers() {
+        defaultRt.container.alpha = 1f
+        for (z in zonesRt) z.container.alpha = 1f
+    }
+
+    private fun recognizer(src: String): TextRecognizer {
+        val key = when (src) { "ja" -> "ja"; "ko" -> "ko"; "zh" -> "zh"; else -> "latin" }
         return recognizers.getOrPut(key) {
             when (key) {
                 "ja" -> TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
@@ -379,24 +365,29 @@ class TranslateService : Service() {
         }
     }
 
-    /** يحوّل نسب المنطقة المحفوظة إلى بكسلات الشاشة */
-    private fun rectOf(r: RegionPref): Rect {
-        val left = (r.l * w).toInt().coerceIn(0, w - 2)
-        val top = (r.t * h).toInt().coerceIn(0, h - 2)
-        val right = (r.r * w).toInt().coerceIn(left + 2, w)
-        val bottom = (r.b * h).toInt().coerceIn(top + 2, h)
+    private fun rectOf(z: Zone): Rect {
+        val left = (z.l * w).toInt().coerceIn(0, w - 2)
+        val top = (z.t * h).toInt().coerceIn(0, h - 2)
+        val right = (z.r * w).toInt().coerceIn(left + 2, w)
+        val bottom = (z.b * h).toInt().coerceIn(top + 2, h)
         return Rect(left, top, right, bottom)
     }
 
-    private fun grab(tries: Int, clean: Boolean) {
+    private fun zoneRect(z: ZoneRt): Rect =
+        if (z === defaultRt) Rect(0, 0, w, h) else rectOf(z.cfg)
+
+    private fun excludeRects(): List<Rect> =
+        zonesRt.filter { it.cfg.mode == 1 && it.cfg.enabled }.map { rectOf(it.cfg) }
+
+    private fun grab(tries: Int, due: List<ZoneRt>, clean: List<ZoneRt>) {
         val img = reader?.acquireLatestImage()
         if (img == null) {
             // لا إطار جديد: في الفحص العادي معناها أن الشاشة ثابتة
-            if (clean && tries < 5) {
-                handler.postDelayed({ grab(tries + 1, true) }, 100)
+            if (clean.isNotEmpty() && tries < 5) {
+                handler.postDelayed({ grab(tries + 1, due, clean) }, 100)
             } else {
-                overlayRoot?.alpha = 1f
-                next()
+                showContainers()
+                finishCycle(due)
             }
             return
         }
@@ -407,13 +398,18 @@ class TranslateService : Service() {
         )
         bmp.copyPixelsFromBuffer(p.buffer)
         img.close()
-        overlayRoot?.alpha = 1f
+        showContainers()
+        runZones(bmp, due, 0, clean)
+    }
 
-        val inc = if (cfg.inc.on) rectOf(cfg.inc) else Rect(0, 0, w, h)
-        val cx = min(inc.left, bmp.width - 2)
-        val cy = min(inc.top, bmp.height - 2)
-        val cw = max(2, min(inc.width(), bmp.width - cx))
-        val ch = max(2, min(inc.height(), bmp.height - cy))
+    private fun runZones(bmp: Bitmap, due: List<ZoneRt>, i: Int, clean: List<ZoneRt>) {
+        if (i >= due.size) { finishCycle(due); return }
+        val z = due[i]
+        val rc = zoneRect(z)
+        val cx = min(rc.left, bmp.width - 2)
+        val cy = min(rc.top, bmp.height - 2)
+        val cw = max(2, min(rc.width(), bmp.width - cx))
+        val ch = max(2, min(rc.height(), bmp.height - cy))
         var part = Bitmap.createBitmap(bmp, cx, cy, cw, ch)
         val k = cfg.scale / 100f
         if (k < 0.99f) {
@@ -421,32 +417,45 @@ class TranslateService : Service() {
                 part, max(1, (cw * k).toInt()), max(1, (ch * k).toInt()), true
             )
         }
-
-        recognizer().process(InputImage.fromBitmap(part, 0))
-            .addOnSuccessListener { handleText(it, clean, cx, cy, k) }
-            .addOnFailureListener { next() }
+        val isClean = clean.contains(z)
+        recognizer(effSrc(z)).process(InputImage.fromBitmap(part, 0))
+            .addOnSuccessListener {
+                handleText(z, it, isClean, cx, cy, k)
+                runZones(bmp, due, i + 1, clean)
+            }
+            .addOnFailureListener { runZones(bmp, due, i + 1, clean) }
     }
 
-    private fun barRect(): Rect? {
-        val b = bar ?: return null
+    private fun viewRect(v: View?): Rect? {
+        if (v == null || !v.isAttachedToWindow) return null
         val loc = IntArray(2)
-        b.getLocationOnScreen(loc)
-        return Rect(loc[0], loc[1], loc[0] + b.width, loc[1] + b.height)
+        v.getLocationOnScreen(loc)
+        return Rect(loc[0], loc[1], loc[0] + v.width, loc[1] + v.height)
     }
 
-    private fun validText(s: String): Boolean {
-        val minLetters = if (cfg.src in listOf("ja", "ko", "zh")) 1 else 3
+    private fun uiRects(): List<Rect> {
+        val out = ArrayList<Rect>()
+        viewRect(bar)?.let { out.add(it) }
+        for (z in zonesRt) viewRect(z.strip)?.let { out.add(it) }
+        return out
+    }
+
+    private fun validText(src: String, s: String): Boolean {
+        val minLetters = if (src in listOf("ja", "ko", "zh")) 1 else 3
         if (s.count { it.isLetter() } < minLetters) return false
-        if (s.any { it in '\u0600'..'\u06FF' }) return false // نص عربي (غالباً من الترجمة نفسها)
+        if (s.any { it in '\u0600'..'\u06FF' }) return false
         return true
     }
 
+    private fun cacheKey(z: ZoneRt, text: String) = "${effSrc(z)}|${effTgt(z)}|$text"
+
     private fun grow(r: Rect): Rect = Rect(r).apply { inset(-PAD, -PAD) }
 
-    private fun handleText(t: Text, clean: Boolean, offX: Int, offY: Int, k: Float) {
-        if (!auto) { busy = false; return }
-        val btn = barRect()
-        val exc = if (cfg.exc.on) rectOf(cfg.exc) else null
+    private fun handleText(z: ZoneRt, t: Text, clean: Boolean, offX: Int, offY: Int, k: Float) {
+        if (!auto) return
+        val srcLang = effSrc(z)
+        val ui = uiRects()
+        val exc = excludeRects()
         val minConf = cfg.conf / 100f
         val cands = ArrayList<Cand>()
         for (b in t.textBlocks) {
@@ -456,11 +465,10 @@ class TranslateService : Service() {
                 (bb.right / k).toInt() + offX, (bb.bottom / k).toInt() + offY
             )
             val src = b.text.replace("\n", " ").trim()
-            if (!validText(src)) continue
-            if (ignore.contains(src.lowercase())) continue
-            if (btn != null && Rect.intersects(btn, box)) continue
-            if (exc != null && coverage(box, exc) > 0.3f) continue
-            // ثقة القراءة: نتجاهل النصوص المشوّشة (رسوم الجدران والأشكال العشوائية)
+            if (!validText(srcLang, src)) continue
+            if (cache[cacheKey(z, src)] == "") continue
+            if (ui.any { Rect.intersects(it, box) }) continue
+            if (exc.any { coverage(box, it) > 0.3f }) continue
             if (b.lines.isNotEmpty()) {
                 val conf = b.lines.map { it.confidence }.average().toFloat()
                 if (conf > 0f && conf < minConf) continue
@@ -470,60 +478,97 @@ class TranslateService : Service() {
 
         val now = SystemClock.uptimeMillis()
         if (!clean) {
-            // فحص عادي: نبحث فقط عن نص جديد لم يُغطَّ بترجمة بعد
-            val fresh = cands.filter { c -> tracked.none { coverage(c.box, it.rect) > 0.4f } }
-            process(fresh)
+            val fresh = cands.filter { c -> z.tracked.none { coverage(c.box, it.rect) > 0.4f } }
+            process(z, fresh)
         } else {
-            // فحص نظيف: نطابق ما نراه مع ما نعرضه، ونزيل ما اختفى، ونضيف الجديد
-            val keep = BooleanArray(tracked.size)
+            val keep = BooleanArray(z.tracked.size)
             val toAdd = ArrayList<Cand>()
             for (c in cands) {
                 val cr = grow(c.box)
                 var m = -1
-                for (i in tracked.indices) {
-                    if (!keep[i] && iou(cr, tracked[i].rect) > 0.4f && similar(c.src, tracked[i].src)) {
+                for (i in z.tracked.indices) {
+                    if (!keep[i] && iou(cr, z.tracked[i].rect) > 0.4f && similar(c.src, z.tracked[i].src)) {
                         m = i; break
                     }
                 }
-                if (m >= 0) { keep[m] = true; tracked[m].seen = now } else toAdd.add(c)
+                if (m >= 0) { keep[m] = true; z.tracked[m].seen = now } else toAdd.add(c)
             }
-            for (i in tracked.indices.reversed()) {
+            for (i in z.tracked.indices.reversed()) {
                 if (!keep[i]) {
-                    overlayRoot?.removeView(tracked[i].view)
-                    tracked.removeAt(i)
+                    z.container.removeView(z.tracked[i].view)
+                    z.tracked.removeAt(i)
                 }
             }
-            process(toAdd)
+            process(z, toAdd)
         }
-        next()
+    }
+
+    private fun expireTtl(z: ZoneRt, now: Long) {
+        for (i in z.tracked.indices.reversed()) {
+            if (now - z.tracked[i].seen > cfg.ttl) {
+                z.container.removeView(z.tracked[i].view)
+                z.tracked.removeAt(i)
+            }
+        }
     }
 
     // ---------- الترجمة ----------
 
-    private fun process(list: List<Cand>) {
+    private fun process(z: ZoneRt, list: List<Cand>) {
+        val need = ArrayList<Cand>()
+        val keys = ArrayList<String>()
         for (c in list) {
             val key = "${c.src}@${c.box.left / 50},${c.box.top / 50}"
-            if (!inflight.add(key)) continue
-            translateAsync(c.src) { dst ->
-                inflight.remove(key)
-                if (dst == "") ignore.add(c.src.lowercase())
-                else if (dst != null && auto) addTracked(c, dst)
+            if (!z.inflight.add(key)) continue
+            val g = cfg.glossary[c.src.lowercase().trim()]
+            if (g != null) { z.inflight.remove(key); addTracked(z, c, g); continue }
+            val cached = cache[cacheKey(z, c.src)]
+            if (cached != null) {
+                z.inflight.remove(key)
+                if (cached != "") addTracked(z, c, cached)
+                continue
             }
+            need.add(c); keys.add(key)
+        }
+        if (need.isEmpty()) return
+
+        if (cfg.cloud && cfg.apiKey.isNotBlank()) {
+            Cloud.translate(cfg.apiKey, cfg.model, effSrc(z), effTgt(z), need.map { it.src }) { res ->
+                if (res != null && res.size == need.size) {
+                    for (i in need.indices) finishItem(z, need[i], keys[i], res[i])
+                } else {
+                    for (i in need.indices) mlkit(z, need[i], keys[i])
+                }
+            }
+        } else {
+            for (i in need.indices) mlkit(z, need[i], keys[i])
         }
     }
 
-    /** النتيجة: نص مترجم، أو "" = تجاهل هذا النص نهائياً، أو null = فشل مؤقت */
-    private fun translateAsync(src: String, cb: (String?) -> Unit) {
-        val s = cfg
-        // القاموس المخصص أولاً
-        s.glossary[src.lowercase().trim()]?.let { cb(it); return }
+    private fun mlkit(z: ZoneRt, c: Cand, key: String) {
+        translateAsync(effSrc(z), effTgt(z), c.src) { dst -> finishItem(z, c, key, dst) }
+    }
 
-        val key = "${s.src}|${s.tgt}|$src"
-        cache[key]?.let { cb(it); return }
+    /** dst: نص مترجم، أو "" = تجاهل، أو null = فشل مؤقت */
+    private fun finishItem(z: ZoneRt, c: Cand, key: String, dst: String?) {
+        z.inflight.remove(key)
+        if (dst == null) return
+        val ck = cacheKey(z, c.src)
+        if (cache.size > 800) cache.clear()
+        if (dst.isBlank() || dst.trim().equals(c.src.trim(), true)) {
+            cache[ck] = ""
+        } else {
+            cache[ck] = dst
+            addTracked(z, c, dst)
+        }
+    }
+
+    private fun translateAsync(src: String, tgt: String, text: String, cb: (String?) -> Unit) {
+        val s = cfg
 
         fun doTranslate(from: String) {
             val a = TranslateLanguage.fromLanguageTag(from)
-            val b = TranslateLanguage.fromLanguageTag(s.tgt)
+            val b = TranslateLanguage.fromLanguageTag(tgt)
             if (a == null || b == null || a == b) { cb(""); return }
             val tr = translators.getOrPut("$a>$b") {
                 Translation.getClient(
@@ -532,13 +577,8 @@ class TranslateService : Service() {
             }
             tr.downloadModelIfNeeded()
                 .addOnSuccessListener {
-                    tr.translate(src)
-                        .addOnSuccessListener { r ->
-                            val out = if (r.trim().equals(src.trim(), true)) "" else r
-                            if (cache.size > 800) cache.clear()
-                            cache[key] = out
-                            cb(out)
-                        }
+                    tr.translate(text)
+                        .addOnSuccessListener { r -> cb(r) }
                         .addOnFailureListener { cb(null) }
                 }
                 .addOnFailureListener {
@@ -550,38 +590,48 @@ class TranslateService : Service() {
                 }
         }
 
-        if (s.src == "auto" || s.smart || s.strict) {
-            identifier.identifyLanguage(src)
+        if (src == "auto" || s.smart || s.strict) {
+            identifier.identifyLanguage(text)
                 .addOnSuccessListener { code ->
-                    if (s.src == "auto") {
-                        if (code == "und" || code == s.tgt) cb("") else doTranslate(code)
+                    if (src == "auto") {
+                        if (code == "und" || code == tgt) cb("") else doTranslate(code)
                     } else if (s.strict) {
-                        // صارم: لا نترجم إلا إذا تأكد الكشف أن النص بلغة اللعبة
-                        if (code != s.src) cb("") else doTranslate(s.src)
+                        if (code != src) cb("") else doTranslate(src)
                     } else {
-                        if (code != "und" && code != s.src) cb("") else doTranslate(s.src)
+                        if (code != "und" && code != src) cb("") else doTranslate(src)
                     }
                 }
                 .addOnFailureListener { cb(null) }
         } else {
-            doTranslate(s.src)
+            doTranslate(src)
         }
     }
 
     // ---------- العرض ----------
 
-    private fun isRtl() = cfg.tgt in setOf("ar", "fa", "ur", "he")
+    private fun isRtl(tgt: String) = tgt in setOf("ar", "fa", "ur", "he")
 
-    private fun addTracked(c: Cand, dst: String) {
-        val root = overlayRoot ?: return
+    private fun colorFor(c: Cand): Int {
+        if (!cfg.colorize) return Color.WHITE
+        return when {
+            c.box.top > h * 0.6f && c.src.length >= 20 -> 0xFFFFE082.toInt()                  // حوار
+            c.box.top < h * 0.35f && c.box.left < w * 0.5f && c.src.length >= 12 ->
+                0xFFA5D6A7.toInt()                                                            // مهمة
+            c.src.length < 18 -> Color.WHITE                                                  // قائمة
+            else -> 0xFF80DEEA.toInt()
+        }
+    }
+
+    private fun addTracked(z: ZoneRt, c: Cand, dst: String) {
         val rect = grow(c.box)
-        if (tracked.any { coverage(c.box, it.rect) > 0.4f }) return
+        if (z.tracked.any { coverage(c.box, it.rect) > 0.4f }) return
+        val tgt = effTgt(z)
         val tv = TextView(this).apply {
             text = dst
-            setTextColor(Color.WHITE)
+            setTextColor(colorFor(c))
             setBackgroundColor(Color.argb(cfg.opacity * 255 / 100, 0, 0, 0))
             gravity = Gravity.CENTER
-            textDirection = if (isRtl()) View.TEXT_DIRECTION_RTL else View.TEXT_DIRECTION_LTR
+            textDirection = if (isRtl(tgt)) View.TEXT_DIRECTION_RTL else View.TEXT_DIRECTION_LTR
             setPadding(8, 2, 8, 2)
             setAutoSizeTextTypeUniformWithConfiguration(14, 64, 2, TypedValue.COMPLEX_UNIT_PX)
         }
@@ -589,14 +639,46 @@ class TranslateService : Service() {
             leftMargin = rect.left
             topMargin = rect.top
         }
-        root.addView(tv, lp)
-        tracked.add(Tracked(c.src, rect, tv, SystemClock.uptimeMillis()))
+        z.container.addView(tv, lp)
+        z.tracked.add(Tracked(c.src, rect, tv, SystemClock.uptimeMillis()))
+        onNewTranslation(z, c, dst, tgt)
     }
 
-    private fun removeAllTracked() {
-        overlayRoot?.removeAllViews()
-        overlayRoot?.alpha = 1f
-        tracked.clear()
+    private fun onNewTranslation(z: ZoneRt, c: Cand, dst: String, tgt: String) {
+        if (dst == lastLogged) return
+        lastLogged = dst
+        if (cfg.history) {
+            try {
+                val f = File(filesDir, "history.txt")
+                if (f.length() > 400_000) f.writeText("")
+                val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                val name = if (z === defaultRt) "كامل الشاشة" else z.cfg.name
+                f.appendText("$ts | $name | ${c.src} | $dst\n")
+            } catch (e: Exception) {
+            }
+        }
+        if (cfg.tts && (!cfg.ttsLong || c.src.length >= 20)) speak(dst, tgt)
+    }
+
+    private fun speak(text: String, tgt: String) {
+        val t = tts ?: return
+        if (!ttsReady) return
+        val r = t.setLanguage(Locale.forLanguageTag(tgt))
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) return
+        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "tr")
+    }
+
+    private fun clearTracked(z: ZoneRt) {
+        z.container.removeAllViews()
+        z.container.alpha = 1f
+        z.tracked.clear()
+        z.inflight.clear()
+    }
+
+    private fun clearAllTracked() {
+        if (!::defaultRt.isInitialized) return
+        clearTracked(defaultRt)
+        for (z in zonesRt) clearTracked(z)
     }
 
     private fun addOverlayRoot() {
@@ -605,10 +687,7 @@ class TranslateService : Service() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            FLAGS_BASE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             layoutInDisplayCutoutMode =
@@ -616,6 +695,215 @@ class TranslateService : Service() {
         }
         wm.addView(root, lp)
         overlayRoot = root
+    }
+
+    private fun newContainer(): FrameLayout {
+        val c = FrameLayout(this)
+        overlayRoot?.addView(
+            c, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        return c
+    }
+
+    // ---------- الشاشات العائمة ----------
+
+    private fun cell(t: String, click: (() -> Unit)? = null): TextView = TextView(this).apply {
+        text = t
+        setTextColor(Color.WHITE)
+        textSize = 13f
+        gravity = Gravity.CENTER
+        setPadding(22, 16, 22, 16)
+        if (click != null) setOnClickListener { click() }
+    }
+
+    private fun saveAllZones() = saveZones(prefs, zonesRt.map { it.cfg })
+
+    private fun syncZones() {
+        if (!started && !::defaultRt.isInitialized) return
+        val list = loadZones(prefs)
+        for (rt in zonesRt.toList()) {
+            if (list.none { it.id == rt.cfg.id }) removeZoneRt(rt)
+        }
+        for (z in list) {
+            val rt = zonesRt.find { it.cfg.id == z.id }
+            if (rt == null) {
+                createZoneRt(z)
+            } else {
+                val o = rt.cfg
+                val rectChanged = abs(z.l - o.l) > 0.0005f || abs(z.t - o.t) > 0.0005f ||
+                    abs(z.r - o.r) > 0.0005f || abs(z.b - o.b) > 0.0005f
+                val changed = z.src != o.src || z.tgt != o.tgt || z.mode != o.mode || !z.enabled
+                rt.cfg = z
+                if (rectChanged && !rt.editing) {
+                    rt.rect.set(z.l * w, z.t * h, z.r * w, z.b * h)
+                    applyRect(rt)
+                    clearTracked(rt)
+                }
+                if (changed) clearTracked(rt)
+                refreshZoneUi(rt)
+            }
+        }
+    }
+
+    private fun createZoneRt(z: Zone) {
+        val rt = ZoneRt(z, newContainer())
+        zonesRt.add(rt)
+        buildZoneWindows(rt)
+        if (pendingEdit == z.id) {
+            pendingEdit = null
+            setEditing(rt, true)
+        }
+    }
+
+    private fun removeZoneRt(rt: ZoneRt) {
+        rt.frame?.let { runCatching { wm.removeView(it) } }
+        rt.strip?.let { runCatching { wm.removeView(it) } }
+        overlayRoot?.removeView(rt.container)
+        zonesRt.remove(rt)
+    }
+
+    private fun buildZoneWindows(rt: ZoneRt) {
+        val fv = ZoneFrameView(this)
+        val lp = WindowManager.LayoutParams(
+            100, 100, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            FLAGS_BASE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        rt.frame = fv
+        rt.frameLp = lp
+        rt.rect.set(rt.cfg.l * w, rt.cfg.t * h, rt.cfg.r * w, rt.cfg.b * h)
+        fv.onDrag = { mode, dx, dy -> dragZone(rt, mode, dx, dy) }
+        fv.onDone = { finishDrag(rt) }
+        wm.addView(fv, lp)
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xE6222222.toInt())
+        }
+        val cName = cell(rt.cfg.name)
+        val cToggle = cell("■") { toggleZone(rt) }
+        val cEdit = cell("✎") { setEditing(rt, !rt.editing) }
+        val cFine = cell("دقة") { rt.fine = !rt.fine; refreshZoneUi(rt) }
+        val cSet = cell("⚙") { openSettings() }
+        val cDel = cell("✕") { deleteZone(rt) }
+        for (c in listOf(cName, cToggle, cEdit, cFine, cSet, cDel)) row.addView(c)
+        rt.strip = row
+        rt.cellName = cName; rt.cellToggle = cToggle; rt.cellEdit = cEdit; rt.cellFine = cFine
+
+        val slp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, FLAGS_BASE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        rt.stripLp = slp
+        wm.addView(row, slp)
+        applyRect(rt)
+        refreshZoneUi(rt)
+    }
+
+    private fun applyRect(rt: ZoneRt) {
+        val fv = rt.frame ?: return
+        val lp = rt.frameLp ?: return
+        lp.x = rt.rect.left.toInt()
+        lp.y = rt.rect.top.toInt()
+        lp.width = max(40, rt.rect.width().toInt())
+        lp.height = max(40, rt.rect.height().toInt())
+        runCatching { wm.updateViewLayout(fv, lp) }
+        val st = rt.strip ?: return
+        val slp = rt.stripLp ?: return
+        slp.x = rt.rect.left.toInt()
+        slp.y = max(0, rt.rect.top.toInt() - 90)
+        runCatching { wm.updateViewLayout(st, slp) }
+    }
+
+    private fun refreshZoneUi(rt: ZoneRt) {
+        val z = rt.cfg
+        val fv = rt.frame ?: return
+        fv.accent = if (z.mode == 0) 0xFF2ECC71.toInt() else 0xFFE74C3C.toInt()
+        fv.editing = rt.editing
+        fv.zoneEnabled = z.enabled
+        fv.fine = rt.fine
+        fv.invalidate()
+        rt.cellName?.text = z.name
+        rt.cellToggle?.text = if (z.enabled) "■" else "▶"
+        rt.cellEdit?.text = if (rt.editing) "✔" else "✎"
+        rt.cellFine?.setBackgroundColor(if (rt.fine) 0x88FFFFFF.toInt() else Color.TRANSPARENT)
+        val lp = rt.frameLp ?: return
+        lp.flags = if (rt.editing) FLAGS_BASE else FLAGS_BASE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        runCatching { wm.updateViewLayout(fv, lp) }
+    }
+
+    private fun setEditing(rt: ZoneRt, on: Boolean) {
+        rt.editing = on
+        if (on) clearTracked(rt)
+        refreshZoneUi(rt)
+    }
+
+    private fun toggleZone(rt: ZoneRt) {
+        rt.cfg.enabled = !rt.cfg.enabled
+        if (!rt.cfg.enabled) clearTracked(rt)
+        saveAllZones()
+        refreshZoneUi(rt)
+    }
+
+    private fun deleteZone(rt: ZoneRt) {
+        removeZoneRt(rt)
+        saveAllZones()
+    }
+
+    private fun dragZone(rt: ZoneRt, mode: Int, dx: Float, dy: Float) {
+        val r = rt.rect
+        val minS = 80f
+        if (mode == 1) {
+            val ww = r.width()
+            val hh = r.height()
+            r.left = (r.left + dx).coerceIn(0f, max(0f, w - ww))
+            r.top = (r.top + dy).coerceIn(0f, max(0f, h - hh))
+            r.right = r.left + ww
+            r.bottom = r.top + hh
+        } else {
+            if ((mode and 2) != 0) r.left = min(r.left + dx, r.right - minS)
+            if ((mode and 8) != 0) r.right = max(r.right + dx, r.left + minS)
+            if ((mode and 4) != 0) r.top = min(r.top + dy, r.bottom - minS)
+            if ((mode and 16) != 0) r.bottom = max(r.bottom + dy, r.top + minS)
+            r.left = r.left.coerceIn(0f, w.toFloat())
+            r.right = r.right.coerceIn(0f, w.toFloat())
+            r.top = r.top.coerceIn(0f, h.toFloat())
+            r.bottom = r.bottom.coerceIn(0f, h.toFloat())
+        }
+        applyRect(rt)
+    }
+
+    private fun finishDrag(rt: ZoneRt) {
+        rt.cfg.l = rt.rect.left / w
+        rt.cfg.t = rt.rect.top / h
+        rt.cfg.r = rt.rect.right / w
+        rt.cfg.b = rt.rect.bottom / h
+        saveAllZones()
+    }
+
+    private fun addZone(mode: Int) {
+        val list = loadZones(prefs)
+        val n = list.count { it.mode == mode } + 1
+        val z = Zone(
+            UUID.randomUUID().toString().take(8),
+            if (mode == 0) "شاشة $n" else "استبعاد $n",
+            0.3f, 0.35f, 0.7f, 0.65f, true, mode, "", "", 0L
+        )
+        pendingEdit = z.id
+        list.add(z)
+        saveZones(prefs, list)
+        syncZones()
     }
 
     // ---------- الشريط العائم ----------
@@ -634,157 +922,57 @@ class TranslateService : Service() {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(0xDD1565C0.toInt())
         }
-        fun cell(t: String) = TextView(this).apply {
-            text = t
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            gravity = Gravity.CENTER
-            setPadding(26, 20, 26, 20)
-        }
-        val toggle = cell("▶ ترجمة")
-        toggleView = toggle
-        row.addView(toggle)
-        row.addView(cell("منطقة"))
-        row.addView(cell("استبعاد"))
-        row.addView(cell("⚙"))
-
-        row.setOnTouchListener(object : View.OnTouchListener {
-            var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+        val handle = cell("✥")
+        handle.setOnTouchListener(object : View.OnTouchListener {
+            var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        sx = bp.x; sy = bp.y; tx = e.rawX; ty = e.rawY; moved = false
-                    }
+                    MotionEvent.ACTION_DOWN -> { sx = bp.x; sy = bp.y; tx = e.rawX; ty = e.rawY }
                     MotionEvent.ACTION_MOVE -> {
-                        val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
-                        if (abs(dx) > 10 || abs(dy) > 10) moved = true
-                        if (moved) { bp.x = sx + dx; bp.y = sy + dy; wm.updateViewLayout(v, bp) }
-                    }
-                    MotionEvent.ACTION_UP -> if (!moved) {
-                        val x = e.x.toInt()
-                        for (i in 0 until row.childCount) {
-                            val c = row.getChildAt(i)
-                            if (x >= c.left && x < c.right) { onBarAction(i); break }
-                        }
+                        bp.x = sx + (e.rawX - tx).toInt()
+                        bp.y = sy + (e.rawY - ty).toInt()
+                        wm.updateViewLayout(row, bp)
                     }
                 }
                 return true
             }
         })
+        val toggle = cell("▶ ترجمة") { autoByApp = false; setAuto(!auto) }
+        toggleCell = toggle
+        row.addView(handle)
+        row.addView(toggle)
+        row.addView(cell("+ شاشة") { addZone(0) })
+        row.addView(cell("+ استبعاد") { addZone(1) })
+        row.addView(cell("⚙") { openSettings() })
         bar = row
         wm.addView(row, bp)
     }
 
-    private fun onBarAction(i: Int) {
-        when (i) {
-            0 -> onTap()
-            1 -> openPicker("inc")
-            2 -> openPicker("exc")
-            3 -> startActivity(
-                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        }
+    private fun openSettings() {
+        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
-    private fun onTap() {
-        auto = !auto
-        if (auto) {
-            toggleView?.text = "■ إيقاف"
-            handler.post(tick)
-        } else {
-            handler.removeCallbacks(tick)
-            inflight.clear()
-            removeAllTracked()
-            toggleView?.text = "▶ ترجمة"
-        }
-    }
+    // ---------- التشغيل التلقائي مع تطبيق Xbox ----------
 
-    // ---------- تحديد المنطقة ----------
-
-    private fun openPicker(key: String) {
-        if (pickerOpen) return
-        pickerOpen = true
-        removeAllTracked()
-        val dm = screen()
-        val accent = if (key == "inc") 0xFF2ECC71.toInt() else 0xFFE74C3C.toInt()
-        val saved = if (key == "inc") cfg.inc else cfg.exc
-        val pv = PickerView(this, accent, dm.widthPixels, dm.heightPixels)
-        pv.setRect(
-            saved.l * dm.widthPixels, saved.t * dm.heightPixels,
-            saved.r * dm.widthPixels, saved.b * dm.heightPixels
-        )
-
-        val root = FrameLayout(this)
-        root.addView(pv, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
-        ))
-
-        fun btn(t: String, bg: Int, click: () -> Unit) = TextView(this).apply {
-            text = t
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(30, 20, 30, 20)
-            setBackgroundColor(bg)
-            setOnClickListener { click() }
+    private fun checkForeground() {
+        refreshSettings()
+        if (!cfg.autostart) return
+        val um = getSystemService(UsageStatsManager::class.java) ?: return
+        val end = System.currentTimeMillis()
+        val ev = um.queryEvents(end - 15000, end) ?: return
+        val e = UsageEvents.Event()
+        var latest: String? = null
+        while (ev.hasNextEvent()) {
+            ev.getNextEvent(e)
+            if (e.eventType == UsageEvents.Event.ACTIVITY_RESUMED) latest = e.packageName
         }
-        val prefs = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+        if (latest != null && latest != packageName && latest != "com.android.systemui") lastFg = latest
+        val inGame = lastFg == cfg.pkg
+        if (inGame && !auto) {
+            setAuto(true); autoByApp = true
+        } else if (!inGame && auto && autoByApp) {
+            setAuto(false); autoByApp = false
         }
-        val fineBtn = btn("دقة عالية: لا", 0xFF555555.toInt()) {}
-        fineBtn.setOnClickListener {
-            pv.fine = !pv.fine
-            fineBtn.text = if (pv.fine) "دقة عالية: نعم" else "دقة عالية: لا"
-        }
-        val items = listOf(
-            btn("✓ تأكيد", 0xFF2E7D32.toInt()) {
-                val f = pv.fracs()
-                prefs.edit().putBoolean("${key}_on", true)
-                    .putFloat("${key}_l", f[0]).putFloat("${key}_t", f[1])
-                    .putFloat("${key}_r", f[2]).putFloat("${key}_b", f[3]).apply()
-                closePicker()
-            },
-            btn("✕ إلغاء", 0xFF555555.toInt()) { closePicker() },
-            btn("إزالة المنطقة", 0xFF8E2A2A.toInt()) {
-                prefs.edit().putBoolean("${key}_on", false).apply()
-                closePicker()
-            },
-            fineBtn
-        )
-        for (v in items) {
-            row.addView(v, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(6, 0, 6, 0) })
-        }
-        root.addView(row, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        ).apply { topMargin = 60 })
-
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        }
-        wm.addView(root, lp)
-        pickerRoot = root
-        toast(if (key == "inc") "اسحب لرسم منطقة الترجمة" else "اسحب لرسم منطقة الاستبعاد")
-    }
-
-    private fun closePicker() {
-        pickerRoot?.let { runCatching { wm.removeView(it) } }
-        pickerRoot = null
-        pickerOpen = false
-        cfg = loadSettings(this)
-        if (auto) handler.post(tick)
     }
 
     // ---------- أدوات مساعدة ----------
@@ -832,7 +1020,11 @@ class TranslateService : Service() {
     override fun onDestroy() {
         auto = false
         handler.removeCallbacksAndMessages(null)
-        pickerRoot?.let { runCatching { wm.removeView(it) } }
+        if (started) prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
+        for (z in zonesRt.toList()) {
+            z.frame?.let { runCatching { wm.removeView(it) } }
+            z.strip?.let { runCatching { wm.removeView(it) } }
+        }
         overlayRoot?.let { runCatching { wm.removeView(it) } }
         bar?.let { runCatching { wm.removeView(it) } }
         vd?.release()
@@ -841,6 +1033,7 @@ class TranslateService : Service() {
         translators.values.forEach { it.close() }
         recognizers.values.forEach { it.close() }
         identifier.close()
+        tts?.shutdown()
         super.onDestroy()
     }
 }

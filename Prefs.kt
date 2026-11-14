@@ -30,6 +30,16 @@ object Prefs {
     const val ZONES = "zones"
     const val PROFILES = "profiles"
 
+    const val PAIR_IP = "pair_ip"
+    const val PAIR_PORT = "pair_port"
+    const val PAIR_TOKEN = "pair_token"
+    const val TV_POS = "tv_pos"        // 0 = أعلى، 1 = أسفل
+    const val TV_SEND = "tv_send"
+    const val TV_IP = "tv_ip"
+    const val TV_PORT = "tv_port"
+    const val TV_TOKEN = "tv_token"
+    val KEEP = setOf(PROFILES, API_KEY, TV_IP, TV_PORT, TV_TOKEN)
+
     const val DEFAULT_PKG = "com.microsoft.xboxone.smartglass"
     const val DEFAULT_MODEL = "claude-haiku-5-5"
 }
@@ -155,7 +165,7 @@ fun profileNames(p: SharedPreferences): List<String> {
 fun saveProfile(p: SharedPreferences, name: String) {
     val snap = JSONObject()
     for ((k, v) in p.all) {
-        if (k == Prefs.PROFILES || k == Prefs.API_KEY) continue
+        if (k in Prefs.KEEP) continue
         val o = JSONObject()
         when (v) {
             is Boolean -> o.put("t", "b").put("v", v)
@@ -177,7 +187,7 @@ fun loadProfile(p: SharedPreferences, name: String): Boolean {
     val snap = all.optJSONObject(name) ?: return false
     val ed = p.edit()
     for (k in p.all.keys) {
-        if (k != Prefs.PROFILES && k != Prefs.API_KEY) ed.remove(k)
+        if (k !in Prefs.KEEP) ed.remove(k)
     }
     val keys = snap.keys()
     while (keys.hasNext()) {

@@ -3,8 +3,10 @@ package com.example.gametranslator
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.AppOpsManager
+import android.app.UiModeManager
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
@@ -50,6 +52,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (isTv()) {
+            startActivity(Intent(this, TvActivity::class.java))
+            finish()
+            return
+        }
         sp = getSharedPreferences(Prefs.NAME, MODE_PRIVATE)
 
         val col = LinearLayout(this).apply {
@@ -76,6 +83,29 @@ class MainActivity : Activity() {
         stop.setOnClickListener { stopService(Intent(this, TranslateService::class.java)) }
         col.addView(start)
         col.addView(stop)
+
+        // ----- التلفزيون والكاميرا -----
+        col.addView(header("التلفزيون والترجمة بالكاميرا"))
+        col.addView(TextView(this).apply {
+            text = "ثبّت التطبيق على التلفزيون وافتح «مترجم الألعاب (التلفزيون)» ليظهر رمز QR. ثم اضغط الزر أدناه على الهاتف وامسح الرمز ووجّه الكاميرا إلى شاشة التلفزيون."
+            textSize = 13f
+        })
+        col.addView(Button(this).apply {
+            text = "📷  الاقتران مع التلفزيون والترجمة بالكاميرا"
+            setOnClickListener { startActivity(Intent(this@MainActivity, CameraActivity::class.java)) }
+        })
+        col.addView(switchRow("إرسال الترجمة إلى شاشة التلفزيون", Prefs.TV_SEND, true))
+        col.addView(label("مكان لوحة الترجمة على التلفزيون (اختر عكس مكان النص المهم)"))
+        col.addView(spinner(listOf("أعلى الشاشة", "أسفل الشاشة"), sp.getInt(Prefs.TV_POS, 0)) {
+            sp.edit().putInt(Prefs.TV_POS, it).apply()
+        })
+        col.addView(Button(this).apply {
+            text = "نسيان التلفزيون المقترن"
+            setOnClickListener {
+                sp.edit().remove(Prefs.TV_IP).remove(Prefs.TV_PORT).remove(Prefs.TV_TOKEN).apply()
+                Toast.makeText(this@MainActivity, "تم النسيان. اقترن من جديد عند الحاجة", Toast.LENGTH_SHORT).show()
+            }
+        })
 
         // ----- اللغات الافتراضية -----
         col.addView(header("اللغات الافتراضية"))
@@ -186,6 +216,12 @@ class MainActivity : Activity() {
             text = "\nتُطبَّق الإعدادات تلقائياً أثناء التشغيل. أول استخدام لكل لغة يحتاج إنترنت لتنزيل نموذجها."
             textSize = 12f
         })
+    }
+
+    private fun isTv(): Boolean {
+        val ui = getSystemService(UiModeManager::class.java)
+        return ui?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature("android.software.leanback")
     }
 
     override fun onResume() {

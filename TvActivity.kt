@@ -119,17 +119,27 @@ class TvActivity : Activity() {
     }
 
     private fun askOverlay() {
-        try {
-            startActivity(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-            )
-        } catch (e: Exception) {
-            Toast.makeText(
-                this,
-                "افتح إعدادات التلفزيون ← التطبيقات ← الأذونات الخاصة ← العرض فوق التطبيقات",
-                Toast.LENGTH_LONG
-            ).show()
+        val uri = Uri.parse("package:$packageName")
+        val attempts = listOf(
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, uri),
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION),
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri),
+            Intent(Settings.ACTION_MANAGE_ALL_APPLICATIONS_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (i in attempts) {
+            try {
+                startActivity(i)
+                return
+            } catch (e: Exception) {
+                // نجرّب المسار التالي
+            }
         }
+        Toast.makeText(
+            this,
+            "لا توجد صفحة الإذن في هذا التلفزيون. سيُعرض نص الترجمة كرسالة قصيرة بدلاً من اللوحة",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     private fun refresh() {
@@ -157,7 +167,7 @@ class TvActivity : Activity() {
         val ok = Settings.canDrawOverlays(this)
         grantBtn.visibility = if (ok) View.GONE else View.VISIBLE
         warn.text = when {
-            !ok -> "الترجمة لن تظهر فوق الشاشة قبل منح إذن العرض فوق التطبيقات"
+            !ok -> "بدون إذن العرض فوق التطبيقات ستظهر الترجمة كرسالة نصية قصيرة بدل اللوحة"
             TvState.lastError.isNotEmpty() && !TvState.serverUp -> "خطأ: ${TvState.lastError}"
             else -> ""
         }

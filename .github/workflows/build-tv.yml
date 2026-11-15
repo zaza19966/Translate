@@ -19,8 +19,12 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Install Gradle
-      run: sudo apt-get update && sudo apt-get install -y gradle
+    - name: Install Modern Gradle 8.5
+      run: |
+        wget https://services.gradle.org/distributions/gradle-8.5-bin.zip
+        unzip -q gradle-8.5-bin.zip
+        sudo mv gradle-8.5 /opt/gradle
+        echo "/opt/gradle/bin" >> $GITHUB_PATH
 
     - name: Build with Gradle
       run: gradle :app:assembleDebug

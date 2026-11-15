@@ -11,6 +11,18 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
+        <service
+    android:name=".TvService"
+    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+    </intent-filter>
+    <meta-data
+        android:name="android.accessibilityservice"
+        android:resource="@xml/accessibility_service_config" />
+</service>
+        
         android:icon="@mipmap/ic_launcher"
         android:banner="@drawable/tv_banner"
         android:label="مترجم الألعاب - التلفزيون"
@@ -27,10 +39,3 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <service
-            android:name=".TvService"
-            android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
-    </application>
-</manifest>

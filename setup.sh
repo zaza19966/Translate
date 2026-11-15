@@ -123,3 +123,26 @@ cat > $R/drawable/ic_launcher_foreground.xml << 'EOF'
     </group>
 </vector>
 EOF
+
+# لافتة لازمة إن أشار أي ملف Manifest إلى @drawable/tv_banner
+cat > $R/drawable/tv_banner.xml << 'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M0,0 H320 V180 H0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M120,50 H200 A10,10 0 0 1 210,60 V100 A10,10 0 0 1 200,110 H150 L128,134 V110 H120 A10,10 0 0 1 110,100 V60 A10,10 0 0 1 120,50 Z" />
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M124,66 H196 V74 H124 Z" />
+    <path
+        android:fillColor="#1565C0"
+        android:pathData="M124,84 H172 V92 H124 Z" />
+</vector>
+EOF

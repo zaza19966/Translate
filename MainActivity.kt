@@ -95,6 +95,24 @@ class MainActivity : Activity() {
             setOnClickListener { startActivity(Intent(this@MainActivity, CameraActivity::class.java)) }
         })
         col.addView(switchRow("إرسال الترجمة إلى شاشة التلفزيون", Prefs.TV_SEND, true))
+        col.addView(switchRow("عرض الترجمة على شاشة الهاتف أيضاً (عطّله إن أردت المشاهدة على التلفزيون فقط)", Prefs.PHONE_SHOW, true))
+        col.addView(TextView(this).apply {
+            text = "للعب Xbox: اقترن بالتلفزيون مرة واحدة من زر الكاميرا أعلاه، ثم اضغط «تشغيل المترجم» وافتح تطبيق Xbox وابدأ البث إلى الهاتف، واضغط ▶ في الشريط العائم. ستظهر الترجمة على لوحة التلفزيون."
+            textSize = 13f
+        })
+        col.addView(label("نمط الترجمة على التلفزيون"))
+        col.addView(spinner(
+            listOf("لوحة نصية (أعلى أو أسفل الشاشة)", "فوق النص الأصلي مباشرة (يلزمه «إطار البث»)"),
+            sp.getInt(Prefs.TV_MODE, 0)
+        ) { sp.edit().putInt(Prefs.TV_MODE, it).apply() })
+        col.addView(seek("عتمة خلفية الترجمة على التلفزيون (0 = بلا خلفية)", 0, 100,
+            sp.getInt(Prefs.TV_BG, 80), { "$it%" }) { sp.edit().putInt(Prefs.TV_BG, it).apply() })
+        col.addView(seek("حجم خط الترجمة على التلفزيون", 60, 160,
+            sp.getInt(Prefs.TV_TXT, 100), { "$it%" }) { sp.edit().putInt(Prefs.TV_TXT, it).apply() })
+        col.addView(TextView(this).apply {
+            text = "«إطار البث»: من الشريط العائم اضغط «+ إطار» وضع الإطار الأزرق على حدود فيديو اللعبة بدقة (زر «دقة» للتحريك الدقيق)، لتطابق مواضع الترجمة على التلفزيون مواضع النص في اللعبة."
+            textSize = 13f
+        })
         col.addView(label("مكان لوحة الترجمة على التلفزيون (اختر عكس مكان النص المهم)"))
         col.addView(spinner(listOf("أعلى الشاشة", "أسفل الشاشة"), sp.getInt(Prefs.TV_POS, 0)) {
             sp.edit().putInt(Prefs.TV_POS, it).apply()
@@ -272,7 +290,7 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, c -> updateZone(z.id) { it.enabled = c } }
         })
         card.addView(label("النوع"))
-        card.addView(spinner(listOf("ترجمة هذه المنطقة", "استبعاد (تجاهل هذه المنطقة)"), z.mode) { p ->
+        card.addView(spinner(listOf("ترجمة هذه المنطقة", "استبعاد (تجاهل هذه المنطقة)", "إطار البث (حدود الفيديو للعرض على التلفزيون)"), z.mode) { p ->
             updateZone(z.id) { it.mode = p }
         })
         card.addView(label("لغة هذه الشاشة"))

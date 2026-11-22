@@ -35,6 +35,10 @@ object Prefs {
     const val PAIR_TOKEN = "pair_token"
     const val TV_POS = "tv_pos"        // 0 = أعلى، 1 = أسفل
     const val TV_SEND = "tv_send"
+    const val TV_MODE = "tv_mode"     // 0 = لوحة نصية، 1 = فوق النص الأصلي
+    const val TV_BG = "tv_bg"         // عتمة خلفية الترجمة على التلفزيون 0..100
+    const val TV_TXT = "tv_txt"       // حجم الخط على التلفزيون (نسبة %)
+    const val PHONE_SHOW = "phone_show"   // عرض الترجمة على شاشة الهاتف نفسه
     const val TV_IP = "tv_ip"
     const val TV_PORT = "tv_port"
     const val TV_TOKEN = "tv_token"
@@ -112,7 +116,9 @@ data class AppSettings(
     val apiKey: String,
     val model: String,
     val autostart: Boolean,
-    val pkg: String
+    val pkg: String,
+    val tvSend: Boolean,
+    val showOnPhone: Boolean
 )
 
 fun loadSettings(ctx: Context): AppSettings {
@@ -148,7 +154,9 @@ fun loadSettings(ctx: Context): AppSettings {
             .ifBlank { Prefs.DEFAULT_MODEL },
         autostart = p.getBoolean(Prefs.AUTOSTART, false),
         pkg = (p.getString(Prefs.PKG, Prefs.DEFAULT_PKG) ?: Prefs.DEFAULT_PKG)
-            .ifBlank { Prefs.DEFAULT_PKG }
+            .ifBlank { Prefs.DEFAULT_PKG },
+        tvSend = p.getBoolean(Prefs.TV_SEND, true),
+        showOnPhone = p.getBoolean(Prefs.PHONE_SHOW, true)
     )
 }
 

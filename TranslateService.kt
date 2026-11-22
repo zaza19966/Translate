@@ -52,6 +52,8 @@ import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -185,6 +187,13 @@ class TranslateService : Service() {
     private var autoByApp = false
     private var lastLogged = ""
 
+    // ---- إرسال الترجمة إلى التلفزيون (Xbox Remote Play ← الهاتف ← لوحة التلفزيون) ----
+    private val tvLink = TvLink()
+    private var tvLastTry = 0L
+    private var tvLastSent = ""
+    private var tvLastSentAt = 0L
+    private val tvSync = Runnable { syncTv() }
+
     private val cache = HashMap<String, String>()   // "" = تجاهل هذا النص
     private val translators = HashMap<String, Translator>()
     private val recognizers = HashMap<String, TextRecognizer>()
@@ -292,6 +301,8 @@ class TranslateService : Service() {
         } else {
             handler.removeCallbacks(tick)
             clearAllTracked()
+            tvLastSent = ""
+            if (tvLink.connected) tvLink.send("{\"cmd\":\"clear\"}")
         }
     }
 
@@ -346,6 +357,7 @@ class TranslateService : Service() {
         for (z in due) z.nextScan = now + intervalOf(z)
         busy = false
         if (auto) handler.postDelayed(tick, 100)
+        syncTv()
     }
 
     private fun showContainers() {
@@ -639,9 +651,90 @@ class TranslateService : Service() {
             leftMargin = rect.left
             topMargin = rect.top
         }
+        tv.visibility = if (cfg.showOnPhone) View.VISIBLE else View.INVISIBLE
         z.container.addView(tv, lp)
         z.tracked.add(Tracked(c.src, rect, tv, SystemClock.uptimeMillis()))
         onNewTranslation(z, c, dst, tgt)
+        scheduleTvSync()
+    }
+
+    // ---------- الإرسال إلى لوحة التلفزيون ----------
+
+    private fun scheduleTvSync() {
+        if (!cfg.tvSend) return
+        handler.removeCallbacks(tvSync)
+        handler.postDelayed(tvSync, 250)
+    }
+
+    private fun connectTv() {
+        val ip = prefs.getString(Prefs.TV_IP, null) ?: return
+        val port = prefs.getInt(Prefs.TV_PORT, Pairing.PORT)
+        val token = prefs.getString(Prefs.TV_TOKEN, "") ?: ""
+        val now = SystemClock.uptimeMillis()
+        if (now - tvLastTry < 5000) return
+        tvLastTry = now
+        tvLink.connect(ip, port, token) { }
+    }
+
+    /** حدود فيديو البث داخل شاشة الهاتف (من «إطار البث» إن وُجد، وإلا الشاشة كلها) */
+    private fun videoRect(): Rect {
+        val vz = zonesRt.firstOrNull { it.cfg.mode == 2 && it.cfg.enabled }
+        return if (vz != null) rectOf(vz.cfg) else Rect(0, 0, w, h)
+    }
+
+    private fun sendTv(key: String, msg: String) {
+        val now = SystemClock.uptimeMillis()
+        if (key == tvLastSent && now - tvLastSentAt < 10000) return
+        tvLastSent = key
+        tvLastSentAt = now
+        tvLink.send(msg)
+    }
+
+    private fun syncTv() {
+        if (!auto || !cfg.tvSend) return
+        if (prefs.getString(Prefs.TV_IP, null) == null) return   // لا اقتران بعد
+        if (!tvLink.connected) { connectTv(); return }
+        val items = ArrayList<Tracked>()
+        items.addAll(defaultRt.tracked)
+        for (z in zonesRt) if (z.cfg.mode == 0) items.addAll(z.tracked)
+        items.sortBy { it.rect.top }
+        if (items.isEmpty()) {
+            sendTv("", "{\"cmd\":\"clear\"}")
+            return
+        }
+        if (prefs.getInt(Prefs.TV_MODE, 0) == 1) {
+            // فوق النص الأصلي: نرسل مواضع نسبية من فيديو البث
+            val ref = videoRect()
+            val rw = max(1, ref.width()).toFloat()
+            val rh = max(1, ref.height()).toFloat()
+            val arr = JSONArray()
+            for (t in items.take(12)) {
+                val x = ((t.rect.left - ref.left) / rw).coerceIn(0f, 1f)
+                val y = ((t.rect.top - ref.top) / rh).coerceIn(0f, 1f)
+                val ww = (t.rect.width() / rw).coerceIn(0f, 1f)
+                val hh = (t.rect.height() / rh).coerceIn(0f, 1f)
+                arr.put(
+                    JSONObject()
+                        .put("x", x.toDouble()).put("y", y.toDouble())
+                        .put("w", ww.toDouble()).put("h", hh.toDouble())
+                        .put("t", t.view.text.toString())
+                        .put("c", t.view.currentTextColor)
+                )
+            }
+            val tgt = prefs.getString(Prefs.TGT, "ar") ?: "ar"
+            val msg = JSONObject().put("cmd", "boxes").put("items", arr)
+                .put("bg", prefs.getInt(Prefs.TV_BG, 80))
+                .put("txt", prefs.getInt(Prefs.TV_TXT, 100))
+                .put("rtl", tgt in setOf("ar", "fa", "ur", "he"))
+                .toString()
+            sendTv(msg, msg)
+        } else {
+            val lines = items.map { it.view.text.toString() }.distinct().take(6)
+            val pos = if (prefs.getInt(Prefs.TV_POS, 0) == 1) "bottom" else "top"
+            val msg = JSONObject().put("cmd", "show").put("pos", pos)
+                .put("lines", JSONArray(lines)).toString()
+            sendTv(lines.joinToString("\n"), msg)
+        }
     }
 
     private fun onNewTranslation(z: ZoneRt, c: Cand, dst: String, tgt: String) {
@@ -829,7 +922,7 @@ class TranslateService : Service() {
     private fun refreshZoneUi(rt: ZoneRt) {
         val z = rt.cfg
         val fv = rt.frame ?: return
-        fv.accent = if (z.mode == 0) 0xFF2ECC71.toInt() else 0xFFE74C3C.toInt()
+        fv.accent = when (z.mode) { 0 -> 0xFF2ECC71.toInt(); 1 -> 0xFFE74C3C.toInt(); else -> 0xFF42A5F5.toInt() }
         fv.editing = rt.editing
         fv.zoneEnabled = z.enabled
         fv.fine = rt.fine
@@ -897,8 +990,9 @@ class TranslateService : Service() {
         val n = list.count { it.mode == mode } + 1
         val z = Zone(
             UUID.randomUUID().toString().take(8),
-            if (mode == 0) "شاشة $n" else "استبعاد $n",
-            0.3f, 0.35f, 0.7f, 0.65f, true, mode, "", "", 0L
+            when (mode) { 0 -> "شاشة $n"; 1 -> "استبعاد $n"; else -> "إطار البث" },
+            if (mode == 2) 0.05f else 0.3f, if (mode == 2) 0.1f else 0.35f,
+            if (mode == 2) 0.95f else 0.7f, if (mode == 2) 0.9f else 0.65f, true, mode, "", "", 0L
         )
         pendingEdit = z.id
         list.add(z)
@@ -943,6 +1037,7 @@ class TranslateService : Service() {
         row.addView(toggle)
         row.addView(cell("+ شاشة") { addZone(0) })
         row.addView(cell("+ استبعاد") { addZone(1) })
+        row.addView(cell("+ إطار") { addZone(2) })
         row.addView(cell("⚙") { openSettings() })
         bar = row
         wm.addView(row, bp)
@@ -1034,6 +1129,7 @@ class TranslateService : Service() {
         recognizers.values.forEach { it.close() }
         identifier.close()
         tts?.shutdown()
+        tvLink.close()
         super.onDestroy()
     }
 }
